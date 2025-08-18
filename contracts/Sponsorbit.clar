@@ -11,11 +11,19 @@
 (define-constant err-already-rated (err u109))
 (define-constant err-cannot-rate-self (err u110))
 (define-constant err-no-interaction (err u111))
+(define-constant err-insufficient-emergency-funds (err u112))
+(define-constant err-invalid-emergency-amount (err u113))
+(define-constant err-emergency-request-exists (err u114))
+(define-constant err-emergency-not-approved (err u115))
+(define-constant err-emergency-already-disbursed (err u116))
+(define-constant err-emergency-expired (err u117))
 
 (define-data-var next-child-id uint u1)
 (define-data-var next-sponsorship-id uint u1)
 (define-data-var contract-balance uint u0)
 (define-data-var next-rating-id uint u1)
+(define-data-var emergency-fund-balance uint u0)
+(define-data-var next-emergency-request-id uint u1)
 
 (define-map caregivers
   { caregiver: principal }
@@ -103,6 +111,43 @@
     trust-level: uint,
     total-rewards-earned: uint,
     last-reward-claimed: uint
+  }
+)
+
+(define-map emergency-fund-contributors
+  { contributor: principal }
+  {
+    total-contributed: uint,
+    contribution-count: uint,
+    last-contribution: uint,
+    active: bool
+  }
+)
+
+(define-map emergency-requests
+  { request-id: uint }
+  {
+    caregiver: principal,
+    child-id: uint,
+    amount-requested: uint,
+    reason: (string-ascii 300),
+    urgency-level: uint,
+    approved: bool,
+    disbursed: bool,
+    requested-at: uint,
+    approved-at: uint,
+    disbursed-at: uint,
+    expires-at: uint
+  }
+)
+
+(define-map emergency-disbursements
+  { request-id: uint }
+  {
+    amount-disbursed: uint,
+    disbursed-to: principal,
+    disbursed-by: principal,
+    transaction-id: uint
   }
 )
 
@@ -604,3 +649,232 @@
     (+ base-amount (/ (* base-amount (get bonus-percentage rewards)) u100))
   )
 )
+
+(define-public (contribute-to-emergency-fund (amount uint))
+  (let ((contributor tx-sender))
+    (if (> amount u0)
+      (match (stx-transfer? amount contributor (as-contract tx-sender))
+        success
+        (begin
+          (let ((current-contributor (default-to 
+                                      { total-contributed: u0, contribution-count: u0, last-contribution: u0, active: true }
+                                      (map-get? emergency-fund-contributors { contributor: contributor }))))
+            (map-set emergency-fund-contributors
+              { contributor: contributor }
+              {
+                total-contributed: (+ (get total-contributed current-contributor) amount),
+                contribution-count: (+ (get contribution-count current-contributor) u1),
+                last-contribution: stacks-block-height,
+                active: true
+              }
+            )
+            (var-set emergency-fund-balance (+ (var-get emergency-fund-balance) amount))
+            (ok amount)
+          )
+        )
+        error
+        (err error)
+      )
+      err-invalid-emergency-amount
+    )
+  )
+)
+
+(define-public (request-emergency-funds (child-id uint) (amount uint) (reason (string-ascii 300)) (urgency-level uint))
+  (let ((caregiver tx-sender)
+        (request-id (var-get next-emergency-request-id)))
+    (if (and (> amount u0) (<= urgency-level u5) (>= urgency-level u1))
+      (match (map-get? children { child-id: child-id })
+        child-data
+        (if (and (is-eq caregiver (get caregiver child-data)) (get active child-data))
+          (match (map-get? caregivers { caregiver: caregiver })
+            caregiver-data
+            (if (get verified caregiver-data)
+              (if (is-none (get-active-emergency-request caregiver child-id))
+                (let ((expires-at (+ stacks-block-height (calculate-expiry-blocks urgency-level))))
+                  (map-set emergency-requests
+                    { request-id: request-id }
+                    {
+                      caregiver: caregiver,
+                      child-id: child-id,
+                      amount-requested: amount,
+                      reason: reason,
+                      urgency-level: urgency-level,
+                      approved: false,
+                      disbursed: false,
+                      requested-at: stacks-block-height,
+                      approved-at: u0,
+                      disbursed-at: u0,
+                      expires-at: expires-at
+                    }
+                  )
+                  (map-set caregiver-active-requests
+                    { caregiver: caregiver, child-id: child-id }
+                    { request-id: request-id, expires-at: expires-at }
+                  )
+                  (var-set next-emergency-request-id (+ request-id u1))
+                  (ok request-id)
+                )
+                err-emergency-request-exists
+              )
+              err-not-verified
+            )
+            err-not-found
+          )
+          err-unauthorized
+        )
+        err-not-found
+      )
+      err-invalid-emergency-amount
+    )
+  )
+)
+
+(define-public (approve-emergency-request (request-id uint))
+  (if (is-eq tx-sender contract-owner)
+    (match (map-get? emergency-requests { request-id: request-id })
+      request-data
+      (if (not (get approved request-data))
+        (if (< stacks-block-height (get expires-at request-data))
+          (let ((amount (get amount-requested request-data)))
+            (if (<= amount (var-get emergency-fund-balance))
+              (begin
+                (map-set emergency-requests
+                  { request-id: request-id }
+                  (merge request-data {
+                    approved: true,
+                    approved-at: stacks-block-height
+                  })
+                )
+                (ok true)
+              )
+              err-insufficient-emergency-funds
+            )
+          )
+          err-emergency-expired
+        )
+        err-emergency-not-approved
+      )
+      err-not-found
+    )
+    err-owner-only
+  )
+)
+
+(define-public (disburse-emergency-funds (request-id uint))
+  (if (is-eq tx-sender contract-owner)
+    (match (map-get? emergency-requests { request-id: request-id })
+      request-data
+      (if (and (get approved request-data) (not (get disbursed request-data)))
+        (if (< stacks-block-height (get expires-at request-data))
+          (let ((amount (get amount-requested request-data))
+                (caregiver (get caregiver request-data)))
+            (if (<= amount (var-get emergency-fund-balance))
+              (match (as-contract (stx-transfer? amount tx-sender caregiver))
+                success
+                (begin
+                  (map-set emergency-requests
+                    { request-id: request-id }
+                    (merge request-data {
+                      disbursed: true,
+                      disbursed-at: stacks-block-height
+                    })
+                  )
+                  (map-set emergency-disbursements
+                    { request-id: request-id }
+                    {
+                      amount-disbursed: amount,
+                      disbursed-to: caregiver,
+                      disbursed-by: tx-sender,
+                      transaction-id: stacks-block-height
+                    }
+                  )
+                  (map-delete caregiver-active-requests { caregiver: caregiver, child-id: (get child-id request-data) })
+                  (var-set emergency-fund-balance (- (var-get emergency-fund-balance) amount))
+                  (match (map-get? caregivers { caregiver: caregiver })
+                    caregiver-data
+                    (map-set caregivers
+                      { caregiver: caregiver }
+                      (merge caregiver-data { total-received: (+ (get total-received caregiver-data) amount) })
+                    )
+                    true
+                  )
+                  (ok amount)
+                )
+                error
+                (err error)
+              )
+              err-insufficient-emergency-funds
+            )
+          )
+          err-emergency-expired
+        )
+        err-emergency-already-disbursed
+      )
+      err-not-found
+    )
+    err-owner-only
+  )
+)
+
+(define-map caregiver-active-requests
+  { caregiver: principal, child-id: uint }
+  { request-id: uint, expires-at: uint }
+)
+
+(define-private (get-active-emergency-request (caregiver principal) (child-id uint))
+  (match (map-get? caregiver-active-requests { caregiver: caregiver, child-id: child-id })
+    active-request
+    (if (< stacks-block-height (get expires-at active-request))
+      (some (get request-id active-request))
+      (begin
+        (map-delete caregiver-active-requests { caregiver: caregiver, child-id: child-id })
+        none
+      )
+    )
+    none
+  )
+)
+
+(define-private (calculate-expiry-blocks (urgency-level uint))
+  (if (is-eq urgency-level u5)
+    u144
+    (if (is-eq urgency-level u4)
+      u288
+      (if (is-eq urgency-level u3)
+        u432
+        (if (is-eq urgency-level u2)
+          u720
+          u1440
+        )
+      )
+    )
+  )
+)
+
+(define-read-only (get-emergency-fund-balance)
+  (var-get emergency-fund-balance)
+)
+
+(define-read-only (get-emergency-fund-contributor (contributor principal))
+  (map-get? emergency-fund-contributors { contributor: contributor })
+)
+
+(define-read-only (get-emergency-request (request-id uint))
+  (map-get? emergency-requests { request-id: request-id })
+)
+
+(define-read-only (get-emergency-disbursement (request-id uint))
+  (map-get? emergency-disbursements { request-id: request-id })
+)
+
+(define-read-only (get-emergency-fund-stats)
+  {
+    total-balance: (var-get emergency-fund-balance),
+    total-requests: (- (var-get next-emergency-request-id) u1),
+    next-request-id: (var-get next-emergency-request-id)
+  }
+)
+
+
+
