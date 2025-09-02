@@ -9,6 +9,11 @@ requirements = []
 path = 'contracts/Sponsorbit.clar'
 clarity_version = 3
 epoch = 3.1
+
+[contracts.SponsorshipMilestones]
+path = 'contracts/SponsorshipMilestones.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
